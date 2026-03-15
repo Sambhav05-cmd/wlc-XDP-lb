@@ -1,0 +1,5 @@
+*.o
+lb_lc_*
+lb_lwc_*
+lb_wlc_*
+cmd/lb/lb*_bpf.go
