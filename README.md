@@ -1,10 +1,10 @@
- # XDP Weighted Least-Connections Load Balancer
+ # XDP Weighted Least-Connections NAT Load Balancer
 
 High-performance L4 load balancer implemented in XDP/eBPF
 supporting stateful least-connections scheduling with in-datapath
 connection tracking.
 
-A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two scheduling algorithms — **Least Connections (LC)** and **Weighted Least Connections (WLC)** — each available in two connection-tracking modes. Backends are manageable at runtime via an interactive CLI. The load balancer filters traffic based on a configurable set of service VIP–port pairs, allowing multiple services to be handled simultaneously while ensuring unrelated network traffic passes through unaffected.
+It is a NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two scheduling algorithms — **Least Connections (LC)** and **Weighted Least Connections (WLC)** — each available in two connection-tracking modes. Backends are manageable at runtime via an interactive CLI. The load balancer filters traffic based on a configurable set of service VIP–port pairs, allowing multiple services to be handled simultaneously while ensuring unrelated network traffic passes through unaffected.
 
 > **Why XDP?** Packets are processed before entering the Linux networking stack — minimal CPU overhead, maximum throughput.
 
@@ -13,6 +13,7 @@ A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two
 ## Table of Contents
 
 - [Overview](#overview)
+- [Capabilities](#Capabilities)
 - [Why least connections instead of hashing](#Why-least-connections-instead-of-hashing)
 - [Scheduling Algorithms](#scheduling-algorithms)
 - [Connection Tracking Modes](#connection-tracking-modes)
@@ -40,6 +41,11 @@ The dataplane supports multiple concurrent virtual services, dynamic backend poo
 Because all packet classification, scheduling, connection tracking, and address rewriting occur before socket buffer allocation, the design achieves very low processing latency and high throughput under connection-heavy workloads.
 
 This architecture allows the load balancer to adapt to skewed or persistent traffic patterns while retaining the performance advantages of early-ingress packet processing.
+
+---
+
+## Key capabilities
+
 
 ---
 
