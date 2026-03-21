@@ -1,11 +1,10 @@
- # XDP Weighted Least-Connections NAT Load Balancer
- 
-A high-performance Layer-4 load balancer built in the XDP/eBPF fast path, providing stateful connection-aware scheduling with full NAT semantics.
+# XDP Least-Connections NAT Load Balancer
+
+A high-performance Layer-4 NAT based load balancer built in the XDP/eBPF fast path, providing stateful connection-aware scheduling with full NAT semantics.
 
 The dataplane performs connection tracking, backend selection, and bidirectional address rewriting entirely before packets enter the Linux networking stack, enabling low-latency and high-throughput load distribution under heavy connection concurrency.
 
-The system supports both Least-Connections (LC) and Weighted Least-Connections (WLC) scheduling, each available with selectable connection accounting modes.
-Backend pools and virtual service endpoints (VIP–port pairs) can be added, removed, or updated dynamically at runtime through an interactive CLI, without restarting the dataplane.
+The system supports both Least-Connections (LC) and Weighted Least-Connections (WLC) scheduling, each available with selectable connection accounting modes. It is structured as a long-running daemon that loads and owns the BPF program, and a separate control CLI that communicates with the daemon at runtime — without ever restarting the dataplane.
 
 Traffic is steered only for configured services, allowing unrelated network flows to pass through the interface unaffected.
 
@@ -41,19 +40,23 @@ Incoming TCP flows destined for configured virtual service endpoints (VIP–port
 Unlike stateless hashing-based dataplane designs, the load balancer maintains per-connection state directly inside eBPF maps, enabling real-time backend selection based on active connection counts and configurable backend weights.
 Both forward and reverse packet paths are rewritten entirely in the XDP layer, providing complete NAT semantics including source-port translation, symmetric return routing, and deterministic connection teardown handling.
 
-The dataplane supports multiple concurrent virtual services, dynamic backend pool updates at runtime, and two scheduling strategies — Least Connections and Weighted Least Connections — each with selectable connection accounting modes.
-Because all packet classification, scheduling, connection tracking, and address rewriting occur before socket buffer allocation, the design achieves very low processing latency and high throughput under connection-heavy workloads.
+The system is split into three components:
 
-This architecture allows the load balancer to adapt to skewed or persistent traffic patterns while retaining the performance advantages of early-ingress packet processing.
+- **`lbxdpd-lc` / `lbxdpd-wlc`** — long-running daemons that load the BPF program, attach it to the network interface, initialise backend state from a config file, and pin the BPF maps to the filesystem so external tools can reach them. The WLC daemon additionally exposes a gRPC control server over a Unix socket for live weight updates.
+- **`lbctl`** — a standalone control CLI that reads and writes the pinned BPF maps directly for backend and service operations, and connects to the gRPC socket for weight updates. It requires no daemon restart and works against whichever daemon is currently running.
+
+Because all packet classification, scheduling, connection tracking, and address rewriting occur before socket buffer allocation, the design achieves very low processing latency and high throughput under connection-heavy workloads.
 
 ---
 
-## Key capabilities
+## Key Capabilities
+
 - Least-Connections and Weighted Least-Connections scheduling
 - In-datapath TCP connection tracking
 - Full NAT (forward and reverse path rewriting)
 - Multiple virtual services (VIP–port endpoints) with runtime add/remove support
-- Runtime backend addition, removal, and weight updates
+- Runtime backend addition and removal via `lbctl` without dataplane restart
+- Live weight updates on WLC backends via gRPC, applied instantly without connection disruption
 - Stable traffic distribution under bursty or long-lived connections
 
 Because scheduling decisions are made using real-time connection counts, the load balancer adapts automatically to uneven traffic patterns and backend capacity differences while retaining the performance benefits of early ingress processing with XDP.
@@ -123,24 +126,41 @@ Both algorithms are available in two builds, differing only in *when* a connecti
 ---
 
 ## Repository Structure
-
 ```
 .
-├── bpf/                  # eBPF/XDP load balancer program (C)
-├── cmd/lb/               # Go user-space loader and CLI
+├── bpf/                        # eBPF/XDP load balancer programs (C)
+│   ├── lb_lc_est.c             # LC, established-mode
+│   ├── lb_lc_syn.c             # LC, SYN-mode
+│   ├── lb_wlc_est.c            # WLC, established-mode
+│   └── lb_wlc_syn.c            # WLC, SYN-mode
+├── cmd/
+│   ├── lbxdpd-lc/              # LC daemon (loads BPF, pins maps, gRPC control)
+│   ├── lbxdpd-wlc/             # WLC daemon (loads BPF, pins maps, gRPC control)
+│   └── lbctl/                  # CLI — talks to pinned maps and gRPC socket
 ├── configs/
-│   ├── backends_lc.json  # Backend config for LC (no weights)
-│   └── backends_wlc.json # Backend config for WLC (with weights)
+│   ├── backends_lc.json        # Initial service + backend config for LC
+│   └── backends_wlc.json       # Initial service + backend config for WLC (with weights)
+├── proto/
+│   └── control.proto           # gRPC service definition
 └── scripts/
-    └── build.sh          # Builds all four binaries
+    ├── build.sh                 # Builds all binaries
+    ├── gen.sh                   # Regenerates eBPF and protobuf bindings
+    └── llvm.sh                  # Installs LLVM toolchain dependencies
 ```
+
+The system is split into three binaries:
+
+| Binary | Role |
+|--------|------|
+| `lbxdpd-lc` | LC daemon — loads the BPF program, attaches XDP, pins maps, exposes gRPC |
+| `lbxdpd-wlc` | WLC daemon — same as above, adds weight-update support over gRPC |
+| `lbctl` | Control CLI — reads pinned maps directly for backend/service operations; uses gRPC for live weight updates (WLC only) |
 
 ---
 
 ## Prerequisites
 
 Install LLVM and required toolchain dependencies:
-
 ```bash
 sudo ./scripts/llvm.sh
 ```
@@ -151,9 +171,9 @@ sudo ./scripts/llvm.sh
 
 ## Configuration
 
-The load balancer is configured using a **virtual service endpoint (VIP + port)** and a pool of backend servers.
-### LC — `configs/backends_lc.json`
+The load balancer is configured at startup using a JSON file specifying the virtual service endpoint (VIP + port) and the initial backend pool. Backends and services can also be added, removed, or reweighted live via `lbctl` after startup.
 
+### LC — `configs/backends_lc.json`
 ```json
 {
   "service": {
@@ -161,20 +181,13 @@ The load balancer is configured using a **virtual service endpoint (VIP + port)*
     "port": 8000
   },
   "backends": [
-    {
-      "ip": "10.45.179.166",
-      "port": 8000
-    },
-    {
-      "ip": "10.45.179.99",
-      "port": 8000
-    }
+    { "ip": "10.45.179.166", "port": 8000 },
+    { "ip": "10.45.179.99",  "port": 8000 }
   ]
 }
 ```
 
 ### WLC — `configs/backends_wlc.json`
-
 ```json
 {
   "service": {
@@ -182,173 +195,151 @@ The load balancer is configured using a **virtual service endpoint (VIP + port)*
     "port": 8000
   },
   "backends": [
-    {
-      "ip": "10.45.179.166",
-      "port": 8000,
-      "weight": 80
-    },
-    {
-      "ip": "10.45.179.99",
-      "port": 8000,
-      "weight": 20
-    }
+    { "ip": "10.45.179.166", "port": 8000, "weight": 80 },
+    { "ip": "10.45.179.99",  "port": 8000, "weight": 20 }
   ]
 }
 ```
 
-Backends can also be added, removed, or reweighted live via the CLI after startup.
-
 ---
 
 ## Building
-
-Build all four binaries at once:
-
 ```bash
-./build.sh
+./scripts/gen.sh
+./scripts/build.sh
 ```
 
-This produces:
+This produces three binaries in `bin/`:
 
-| Binary | Algorithm | Tracking mode |
-|--------|-----------|---------------|
-| `lb_lc_syn` | Least Connections | SYN |
-| `lb_lc_est` | Least Connections | Established |
-| `lb_wlc_syn` | Weighted Least Connections | SYN |
-| `lb_wlc_est` | Weighted Least Connections | Established |
+| Binary | Description |
+|--------|-------------|
+| `lbxdpd-lc` | LC daemon |
+| `lbxdpd-wlc` | WLC daemon |
+| `lbctl` | Control CLI |
 
 ---
 
 ## Running
-Choose whichever mode load balancer to run.
-Recommended mode is the "syn" mode over the "est" mode for burst of connections, however, you can use "est" for experiment or more stable connection requests
 
-**LC binaries:**
+Start the daemon first. It loads the BPF program, attaches it to the interface, and pins the maps so `lbctl` can reach them.
 
+**LC:**
 ```bash
-sudo ./lb_lc_syn -i <network-interface> -config configs/backends_lc.json
-sudo ./lb_lc_est -i <network-interface> -config configs/backends_lc.json
+sudo ./bin/lbxdpd-lc -i <interface> -mode syn -config configs/backends_lc.json
+sudo ./bin/lbxdpd-lc -i <interface> -mode est -config configs/backends_lc.json
 ```
 
-**WLC binaries:**
-
+**WLC:**
 ```bash
-sudo ./lb_wlc_syn -i <network-interface> -config configs/backends_wlc.json
-sudo ./lb_wlc_est -i <network-interface> -config configs/backends_wlc.json
+sudo ./bin/lbxdpd-wlc -i <interface> -mode syn -config configs/backends_wlc.json
+sudo ./bin/lbxdpd-wlc -i <interface> -mode est -config configs/backends_wlc.json
 ```
 
-Replace `<network-interface>` with the interface to attach the XDP program to (e.g. `eth0`).
+Replace `<interface>` with the interface to attach to (e.g. `eth0`, `wlo1`).
+
+The recommended mode is `-mode syn` for bursty workloads. Use `-mode est` for stable, long-lived connection workloads.
+
+Once the daemon is running, use `lbctl` in a separate terminal.
 
 ---
 
-## Runtime CLI
+## Runtime CLI — Structured Reference
 
-After starting, an interactive prompt becomes available:
+### Backend operations
 
-```
-lb>
-```
-
-### LC commands
-
-| Command | Description |
-|---------|-------------|
-| `add <ip> <port>` | Add a backend server |
-| `del <ip> <port>` | Remove a backend server |
-| `list` | List backends and their current connection counts |
-| `addsvc <ip> <port>` | Add a service endpoint |
-| `delsvc <ip> <port>` | Remove a service endpoint |
-| `list` | List service endpoints |
-
-### WLC commands
-
-| Command | Description |
-|---------|-------------|
-| `add <ip> <port> <weight>` | Add a backend server with a given weight |
-| `del <ip> <port>` | Remove a backend server |
-| `update <ip> <port> <weight>` | Update the weight of an existing backend |
-| `list` | List backends with their weights and connection counts |
-| `addsvc <ip> <port>` | Add a service endpoint |
-| `delsvc <ip> <port>` | Remove a service endpoint |
-| `list` | List service endpoints |
-
-**Example session (WLC):**
-
-```
-lb> add 10.0.0.4 8000 20
-lb> update 10.0.0.2 30
-lb> del 10.0.0.3 8001
-lb> list
-```
+| Command | Syntax | Mode | Description | Notes |
+|--------|--------|------|-------------|------|
+| Add backend | `sudo ./bin/lbctl add <ip> <port> [weight]` | LC + WLC | Inserts a backend server into the pinned BPF backend map | `weight` ignored in LC mode |
+| Delete backend | `sudo ./bin/lbctl del <ip> <port>` | LC + WLC | Removes backend from map | Refused if active connections > 0 |
+| List backends | `sudo ./bin/lbctl list` | LC + WLC | Displays backend index, IP, port, connection count, and weight (if WLC) | Reads from pinned maps |
 
 ---
 
-### Verifying the XDP program is attached
+### Service (VIP) operations
 
-```bash
-sudo bpftool prog show
-```
+| Command | Syntax | Mode | Description | Notes |
+|--------|--------|------|-------------|------|
+| Add service | `sudo ./bin/lbctl addsvc <vip> <port>` | LC + WLC | Registers a virtual service endpoint (VIP:port) | Stored in services BPF map |
+| Delete service | `sudo ./bin/lbctl delsvc <vip> <port>` | LC + WLC | Deregisters the VIP entry | |
+| List services | `sudo ./bin/lbctl listsvc` | LC + WLC | Lists all configured VIPs | |
+
+---
+
+### Weight control (runtime scheduling update)
+
+| Command | Syntax | Mode | Description | Notes |
+|--------|--------|------|-------------|------|
+| Update backend weight | `sudo ./bin/lbctl weight <ip> <port> <weight>` | WLC only | Sends gRPC request to daemon to update backend scheduling weight | Uses Unix domain socket control channel |
+
+---
+
+### Program attachment verification
+
+| Purpose | Command | Description |
+|--------|--------|-------------|
+| Verify XDP program attached | `sudo bpftool prog show` | Lists loaded BPF programs and their attach points |
+
+---
+
+### Operational constraint
+
+| Condition | Behaviour |
+|-----------|-----------|
+| Backend has active connections | `del` command is rejected |
+| Safe removal procedure | Wait for connection drain or stop new flows before deletion |
 
 ---
 
 ## Testing
-To test the connection tracking the connections should persist for some time, you can either try large downloads which take time, or use the socat tool which keeps connections alive without sending alot of data
+
+To test connection tracking, connections need to persist for some time. The `socat` tool is ideal for this — it keeps connections alive without sending large amounts of data.
 
 ### 1. Start backend servers
 
 Run this on each backend machine:
-
 ```bash
 socat TCP-LISTEN:8000,reuseaddr,fork EXEC:/bin/cat
 ```
 
 ### 2. Send a single request
-
-From a client machine:
-
 ```bash
 socat - TCP:<load_balancer_ip>:8000
 ```
 
 ### 3. Simulate high concurrency
-
-Launch 100 parallel requests simultaneously:
-
 ```bash
 for i in $(seq 1 100); do
-socat - TCP:<load_balancer_ip>:8000 &
+  socat - TCP:<load_balancer_ip>:8000 &
 done
 ```
 
 ### 4. Check active kernel TCP connections
-
 ```bash
 ss -tan '( sport = :8000 )' | wc -l
 ```
 
 ### 5. Observe backend distribution
-
+```bash
+sudo ./bin/lbctl list
 ```
-lb> list
-```
 
-Under burst load, the **SYN** variants distribute more evenly than the **established** variants because counters are incremented immediately on SYN arrival. With WLC, backends with higher weights should absorb a proportionally larger share of connections.
+Under burst load, the SYN variants distribute more evenly than the established variants because counters are incremented immediately on SYN arrival. With WLC, backends with higher weights absorb a proportionally larger share of connections.
 
 ---
 
 ## Customization
 
-The load balancer currently handles a maximum of 60000 simultaneous connections. To change this, you can modify the maximum connections and the maximum port to be 1024+maximum connections
-in the bpf program , change the following constants to your desired values:
+The load balancer currently handles a maximum of 60000 simultaneous connections. To change this, modify the constants in the BPF program:
 ```c
 #define MAX_CONNECTIONS 60000
 #define MAX_PORT 61024
 ```
 
-and in the corresponding main go file:
+And the corresponding value in the daemon's `ports.go`:
 ```go
 const maxPort = 61024
 ```
+
 ---
 
 ## References
